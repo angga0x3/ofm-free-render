@@ -6,59 +6,49 @@ publik `opencode.ai/inference/v1` (11 model gratis) + `api.kilo.ai` (14 model gr
 Berdasarkan [`Ebony-Vinyl/dsh-our-free-model`](https://github.com/Ebony-Vinyl/dsh-our-free-model) v2.9.0 (MIT),
 dipotong dari 270 MB → 15 MB dengan membuang binary Windows dan build desktop.
 
-## Kenapa ada `start.sh` + `health-shim.mjs`
+## Arsitektur
 
 Service standalone-nya **sengaja hanya bind `127.0.0.1`** — manajemen dan inferensi
 loopback by design, bind non-loopback ditolak. Render mengarahkan trafik ke `$PORT`
 di `0.0.0.0`. Jadi ada dua hop:
 
 ```
-Render :$PORT  →  health-shim (publik, jawab /health)
+Render :$PORT  →  gateway (publik: /health + /v1/*, tukar key)
                     ↓
               relay 0.0.0.0:$RELAY_PORT   ← mode LAN resmi dari service
                     ↓
               service 127.0.0.1:18900     ← admin tetap privat
 ```
 
-Shim diperlukan karena relay membalas **401** untuk health probe Render yang tanpa auth.
+Gateway (`health-shim.mjs`) menyelesaikan tiga hal sekaligus:
+
+1. **Health check** — relay membalas 401 ke probe Render yang tanpa auth.
+2. **Key stabil** — plan Free tidak punya disk, jadi LAN key OFM berganti tiap boot.
+   Klien memakai `OFM_CLIENT_KEY` (env), gateway menukarnya dengan LAN key aktif.
+3. **Batas permukaan** — hanya `/models`, `/chat/completions`, `/responses`,
+   `/messages` yang diteruskan; manajemen tetap 404 dari luar.
 
 ## Deploy
 
 1. Push repo ini ke GitHub.
 2. Render → **New** → **Blueprint** → pilih repo.
-3. Apply. Tidak ada secret yang perlu diisi.
-
-`render.yaml` sudah menyiapkan disk 1 GB di `/data` supaya kunci API dan pengaturan
-bertahan antar deploy.
+3. Apply. Tidak ada secret yang perlu diisi — `OFM_CLIENT_KEY` di-generate Render.
 
 ## Endpoint
 
 - **Base URL:** `https://<service>.onrender.com/v1`
-- **Auth:** `Authorization: Bearer <LAN key>`
+- **Auth:** `Authorization: Bearer <OFM_CLIENT_KEY>`
 
-### Cara ambil LAN key
+Key ada di Render → service → **Environment** → `OFM_CLIENT_KEY`.
 
-Key dibuat otomatis saat boot pertama. Ada di dashboard manajemen:
-
-```
-http://<service>.onrender.com/health     → cek keyReady
-```
-
-Untuk key lengkap, buka dashboard: `https://<service>.onrender.com/#login=<token>`
-(token tercetak di log Render saat boot, 10 menit, sekali pakai) → menu
-**LAN 推理** → salin LAN Key.
-
-Alternatif: baca langsung dari disk lewat Render Shell:
-
-```bash
-cat /data/ofm/settings.json | python3 -c "import json,sys;print(json.load(sys.stdin)['standaloneLanKey'])"
-```
+`/health` terbuka tanpa auth (dipakai Render) dan tidak membocorkan key —
+hanya `{"ok":true,"keyReady":true}`.
 
 ## Tes
 
 ```bash
 BASE=https://<service>.onrender.com
-KEY=<LAN key>
+KEY=<OFM_CLIENT_KEY>
 
 # health
 curl $BASE/health
@@ -73,18 +63,18 @@ curl $BASE/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4.1-flash-free",
        "messages":[{"role":"user","content":"Baca /etc/hostname"}],
-       "tools":[{"type":"function","function":{"name":"read_file",
-         "parameters":{"type":"object","properties":{"file_path":{"type":"string"}}}}}]}'
+       "tools":[{"type":"function","function":{"name":"read",
+         "parameters":{"type":"object","properties":{"filePath":{"type":"string"}}}}}]}'
 ```
 
-## Model (25)
+## Model (24)
 
 **OpenCode (11, gratis):** `big-pickle` · `deepseek-v4.1-flash-free` ·
 `nemotron-3.5-lightning-free` · `nemotron-3.5-super-vl-free` · `mimo-v2.6-flash-free` ·
 `hy4-flash-free` · `iceman-free` · `beam-free` · `flint-40b-free` · `longcat-2.5-free` ·
 `tidepool-alpha-free`
 
-**Kilo (14, gratis):** `kilo-auto/free` · `inclusionai/ling-3.2-flash:free` ·
+**Kilo (13, gratis):** `kilo-auto/free` · `inclusionai/ling-3.2-flash:free` ·
 `baidu/ernie-5.5-flash-preview:free` · `liquid/lfm-3-1.7b:free` · dll.
 
 ## Hasil tes lokal (sebelum push)
@@ -92,17 +82,26 @@ curl $BASE/v1/chat/completions \
 | Tes | Hasil |
 |---|---|
 | `/health` | 200 `{"ok":true,"keyReady":true}` |
-| chat | 200, **0,9–1,9s** |
-| streaming | SSE normal |
-| toolcall | `read_file` + `{"file_path":"/etc/hostname"}` |
-| 6 request beruntun | **6/6 200, nol 429** |
+| chat | 200, **1,2–2,1s** |
+| 5 request beruntun | **5/5 200**, total 8s |
+| key salah | **401** |
+| management path dari luar | **404** |
+| toolcall (`read`) | `{"filePath":"/etc/hostname"}` |
 | prompt tokens | **~3.990** (vs 15.351 di router sendiri) |
 
-## Catatan
+## Jebakan yang sudah dilewati
 
-- **Tanpa token apa pun.** `Authorization: Bearer public` untuk upstream — tidak ada
-  kredensial yang bisa expired.
-- **Render free tier tidur** setelah ~15 menit idle; request pertama bangun 30–50 detik.
-- Dashboard manajemen hanya listen loopback — di Render hanya `/health` dan `/v1/*`
-  yang bisa diakses dari luar.
-- Lisensi mengikuti upstream (MIT) — lihat `LICENSE` di repo asal.
+1. **Plan Free tidak punya disk** — jangan tambahkan `disk:` di `render.yaml`, Render
+   menolak dengan "disks are not supported for free tier services".
+2. **LAN key berganti tiap boot** — karena data dir dibangun ulang. Itu sebabnya
+   gateway menukar `OFM_CLIENT_KEY` → LAN key aktif per request.
+3. **Nama tool mengikuti manifest opencode** (`read`, `shell`, `edit`, `write`, `grep`,
+   `glob`). Kalau klien mendeklarasikan `read_file`, OFM menolak:
+   *"the model answered by calling read instead of writing an answer"*.
+4. **Render free tier tidur** setelah ~15 menit idle; request pertama bangun 30–50 detik.
+5. **Jangan commit secret** — repo upstream membawa Google OAuth client secret bawaan
+   (untuk channel Gemini); sudah diganti placeholder supaya lolos secret scanning.
+
+## Lisensi
+
+Mengikuti upstream (MIT). Lihat repo asal untuk teks lengkap dan atribusi.

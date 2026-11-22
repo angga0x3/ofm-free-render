@@ -6,14 +6,12 @@ services:
     region: singapore
     buildCommand: echo "no build step"
     startCommand: bash start.sh
-    healthCheckPath: /
+    healthCheckPath: /health
     autoDeploy: true
     envVars:
       - key: NODE_VERSION
         value: "22.19.0"
       - key: OFM_HOME
-        value: /data/ofm
-    disk:
-      name: ofm-data
-      mountPath: /data
-      sizeGB: 1
+        value: /opt/render/project/ofm-data
+      - key: OFM_CLIENT_KEY
+        generateValue: true
