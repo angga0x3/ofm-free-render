@@ -2,7 +2,7 @@ services:
   - type: web
     name: ofm-free
     runtime: node
-    plan: free
+    plan: starter
     region: singapore
     buildCommand: echo "no build step"
     startCommand: bash start.sh
@@ -12,6 +12,10 @@ services:
       - key: NODE_VERSION
         value: "22.19.0"
       - key: OFM_HOME
-        value: /opt/render/project/ofm-data
+        value: /data/ofm
       - key: OFM_CLIENT_KEY
         generateValue: true
+    disk:
+      name: ofm-data
+      mountPath: /data
+      sizeGB: 1

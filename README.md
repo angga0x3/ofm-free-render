@@ -23,8 +23,9 @@ Render :$PORT  →  gateway (publik: /health + /v1/*, tukar key)
 Gateway (`health-shim.mjs`) menyelesaikan tiga hal sekaligus:
 
 1. **Health check** — relay membalas 401 ke probe Render yang tanpa auth.
-2. **Key stabil** — plan Free tidak punya disk, jadi LAN key OFM berganti tiap boot.
-   Klien memakai `OFM_CLIENT_KEY` (env), gateway menukarnya dengan LAN key aktif.
+2. **Key stabil** — klien memakai `OFM_CLIENT_KEY` (env, di-generate Render), gateway
+   menukarnya dengan LAN key aktif milik service. Dengan disk, LAN key itu sendiri
+   juga bertahan antar deploy.
 3. **Batas permukaan** — hanya `/models`, `/chat/completions`, `/responses`,
    `/messages` yang diteruskan; manajemen tetap 404 dari luar.
 
@@ -91,14 +92,19 @@ curl $BASE/v1/chat/completions \
 
 ## Jebakan yang sudah dilewati
 
-1. **Plan Free tidak punya disk** — jangan tambahkan `disk:` di `render.yaml`, Render
-   menolak dengan "disks are not supported for free tier services".
-2. **LAN key berganti tiap boot** — karena data dir dibangun ulang. Itu sebabnya
-   gateway menukar `OFM_CLIENT_KEY` → LAN key aktif per request.
+1. **`disk:` butuh plan berbayar.** Di plan Free, Render menolak dengan
+   *"disks are not supported for free tier services"*. Blueprint ini memakai
+   `plan: starter`, jadi disk 1 GB di `/data` didukung.
+2. **Jangan tulis `standaloneLanKey` = `forwardKey`.** Service menganggap pasangan
+   yang sama sebagai "belum diset" lalu me-mint ulang tiap boot — sudah diukur:
+   key berubah meski disk ada. `start.sh` hanya mengisi `forwardKey`; LAN key
+   dibiarkan milik service dan bertahan lewat disk (terverifikasi: boot 1 = boot 2).
 3. **Nama tool mengikuti manifest opencode** (`read`, `shell`, `edit`, `write`, `grep`,
    `glob`). Kalau klien mendeklarasikan `read_file`, OFM menolak:
    *"the model answered by calling read instead of writing an answer"*.
-4. **Render free tier tidur** setelah ~15 menit idle; request pertama bangun 30–50 detik.
+4. **Plan Free tidur** setelah ~15 menit idle (cold start 30–50 detik) dan bisa
+   di-suspend kalau trafik keluarnya dianggap tidak wajar. `plan: starter` tidak
+   tidur — penting karena service ini terus memanggil upstream.
 5. **Jangan commit secret** — repo upstream membawa Google OAuth client secret bawaan
    (untuk channel Gemini); sudah diganti placeholder supaya lolos secret scanning.
 
