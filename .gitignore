@@ -1,0 +1,6 @@
+node_modules/
+*.log
+service.lock
+settings.json
+channel-credentials.json
+eac-user.json
