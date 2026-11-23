@@ -13,11 +13,11 @@ loopback by design, bind non-loopback ditolak. Render mengarahkan trafik ke `$PO
 di `0.0.0.0`. Jadi ada dua hop:
 
 ```
-Render :$PORT  →  gateway (publik: /health + /v1/*, tukar key)
-                    ↓
-              relay 0.0.0.0:$RELAY_PORT   ← mode LAN resmi dari service
-                    ↓
-              service 127.0.0.1:18900     ← admin tetap privat
+Render :$PORT  →  gateway (publik: /health + /v1/*, tukar key, retry, filter model mati)
+                     ↓
+               relay 0.0.0.0:$RELAY_PORT   ← mode LAN resmi dari service
+                     ↓
+               service 127.0.0.1:18900     ← admin tetap privat
 ```
 
 Gateway (`health-shim.mjs`) menyelesaikan tiga hal sekaligus:
@@ -27,7 +27,7 @@ Gateway (`health-shim.mjs`) menyelesaikan tiga hal sekaligus:
    menukarnya dengan LAN key aktif milik service. Dengan disk, LAN key itu sendiri
    juga bertahan antar deploy.
 3. **Batas permukaan** — hanya `/models`, `/chat/completions`, `/responses`,
-   `/messages` yang diteruskan; manajemen tetap 404 dari luar.
+   `/messages`, `/messages/count_tokens` yang diteruskan; manajemen tetap 404 dari luar.
 
 ## Deploy
 
@@ -35,15 +35,35 @@ Gateway (`health-shim.mjs`) menyelesaikan tiga hal sekaligus:
 2. Render → **New** → **Blueprint** → pilih repo.
 3. Apply. Tidak ada secret yang perlu diisi — `OFM_CLIENT_KEY` di-generate Render.
 
+`autoDeploy: true` — setiap push ke branch yang terhubung langsung memicu deploy ulang.
+
 ## Endpoint
 
-- **Base URL:** `https://<service>.onrender.com/v1`
-- **Auth:** `Authorization: Bearer <OFM_CLIENT_KEY>`
+Base URL: `https://<service>.onrender.com`
+
+Tiga protokol sekaligus, semuanya lewat gateway yang sama:
+
+| Protokol | Path | Auth |
+|---|---|---|
+| [OI] Chat Completions | `POST /v1/chat/completions` | `Authorization: Bearer` / `x-api-key` |
+| [OI] Responses | `POST /v1/responses` | idem |
+| Anthropic Messages | `POST /v1/messages` | `x-api-key` + `anthropic-version` |
+| Anthropic count_tokens | `POST /v1/messages/count_tokens` | idem |
+| Daftar model | `GET /v1/models` | idem |
 
 Key ada di Render → service → **Environment** → `OFM_CLIENT_KEY`.
 
-`/health` terbuka tanpa auth (dipakai Render) dan tidak membocorkan key —
-hanya `{"ok":true,"keyReady":true}`.
+`/health` terbuka tanpa auth (dipakai Render) dan tidak membocorkan key maupun
+port relay internal.
+
+```json
+{"ok":true,"service":"ofm-free","version":"1.1.0","keyReady":true,
+ "relayReady":true,"deadModels":0,"uptime":42}
+```
+
+`?strict=1` membuat `/health` langsung 503 begitu relay key hilang, tanpa masa
+tenggang. Tanpa itu, probe tetap 200 selama `OFM_KEY_GRACE_MS` (default 60 detik)
+supaya cold start tidak dibunuh sebelum service sempat mencetak LAN key.
 
 ## Tes
 
@@ -59,7 +79,20 @@ curl $BASE/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4.1-flash-free","messages":[{"role":"user","content":"2+2?"}]}'
 
-# toolcall
+# streaming (thinking muncul di delta.reasoning)
+curl -N $BASE/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash-free","stream":true,
+       "messages":[{"role":"user","content":"hitung 1-5"}]}'
+
+# Anthropic Messages (thinking ada di blok tersendiri, non-stream)
+curl $BASE/v1/messages \
+  -H "x-api-key: $KEY" -H "anthropic-version: 2023-06-01" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-v4.1-flash-free","max_tokens":50,
+       "messages":[{"role":"user","content":"2+2?"}]}'
+
+# toolcall — nama tool mengikuti manifest opencode (read/shell/edit/write/grep/glob)
 curl $BASE/v1/chat/completions \
   -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4.1-flash-free",
@@ -68,7 +101,18 @@ curl $BASE/v1/chat/completions \
          "parameters":{"type":"object","properties":{"filePath":{"type":"string"}}}}}]}'
 ```
 
-## Model (24)
+## Tes lokal
+
+```bash
+npm run test:gateway
+```
+
+Menjalankan `health-shim.mjs` melawan `test/mock-relay.mjs` — relay tiruan yang
+meniru dua perilaku upstream asli: menolak saat jenuh (502) dan menolak satu id
+model dengan `Model does not support this protocol`. 13 pemeriksaan, tanpa
+kredensial dan tanpa jaringan.
+
+## Model (25 hidup, 26 terdaftar)
 
 **OpenCode (11, gratis):** `big-pickle` · `deepseek-v4.1-flash-free` ·
 `nemotron-3.5-lightning-free` · `nemotron-3.5-super-vl-free` · `mimo-v2.6-flash-free` ·
@@ -78,17 +122,30 @@ curl $BASE/v1/chat/completions \
 **Kilo (13, gratis):** `kilo-auto/free` · `inclusionai/ling-3.2-flash:free` ·
 `baidu/ernie-5.5-flash-preview:free` · `liquid/lfm-3-1.7b:free` · dll.
 
+**Tidak hidup:** `jev-1.13-free` — upstream menolak dengan
+`Model does not support this protocol` di ketiga protokol. Gateway menandainya
+mati selama `OFM_DEAD_MODEL_TTL_MS` (default 30 menit), mengeluarkannya dari
+`/v1/models` (header `x-ofm-filtered: 1`), dan menjawab 400 yang jelas tanpa
+memutar request ke upstream. `GET /v1/models?all=1` menampilkan daftar mentah.
+
+Model `*-vl` terdaftar tapi endpoint image-nya mati di upstream
+(`422 Upstream request failed: Endpoint is unavailable`) — jangan andalkan vision.
+
 ## Hasil tes lokal (sebelum push)
 
 | Tes | Hasil |
 |---|---|
-| `/health` | 200 `{"ok":true,"keyReady":true}` |
-| chat | 200, **1,2–2,1s** |
-| 5 request beruntun | **5/5 200**, total 8s |
-| key salah | **401** |
-| management path dari luar | **404** |
+| `test/gateway.test.mjs` | **13/13 lulus** |
+| `/health` | 200, tanpa port relay, tanpa key |
+| chat | 200, `"OK"` |
+| 12 request serentak | **12/12 200** (mock relay dibatasi 4 konkuren) |
+| streaming | SSE utuh sampai `[DONE]`, `delta.reasoning` ikut |
+| `/v1/messages` | 200, blok `thinking` + `text`, `stop_reason` benar |
+| `/v1/responses` | 200, `phase: final_answer` |
 | toolcall (`read`) | `{"filePath":"/etc/hostname"}` |
-| prompt tokens | **~3.990** (vs 15.351 di router sendiri) |
+| model mati | 400 lokal, 9 ms, lalu hilang dari listing |
+| restart | LAN key sama, `dead-models.json` bertahan |
+| SIGTERM | semua port lepas < 3 detik, tanpa proses zombie |
 
 ## Jebakan yang sudah dilewati
 
@@ -99,14 +156,43 @@ curl $BASE/v1/chat/completions \
    yang sama sebagai "belum diset" lalu me-mint ulang tiap boot — sudah diukur:
    key berubah meski disk ada. `start.sh` hanya mengisi `forwardKey`; LAN key
    dibiarkan milik service dan bertahan lewat disk (terverifikasi: boot 1 = boot 2).
-3. **Nama tool mengikuti manifest opencode** (`read`, `shell`, `edit`, `write`, `grep`,
+3. **`forwardKey` bukan `OFM_CLIENT_KEY`.** `generateValue` Render menghasilkan
+   base64 (`/`, `+`, `=`). Aman di header, tapi nilai itu juga dioper ke pemanggil
+   internal sebagai nilai config. `start.sh` memakai random lokal untuk
+   `forwardKey`, dan `OFM_CLIENT_KEY` tetap string opaque yang hanya lewat header.
+4. **Nama tool mengikuti manifest opencode** (`read`, `shell`, `edit`, `write`, `grep`,
    `glob`). Kalau klien mendeklarasikan `read_file`, OFM menolak:
    *"the model answered by calling read instead of writing an answer"*.
-4. **Plan Free tidur** setelah ~15 menit idle (cold start 30–50 detik) dan bisa
+5. **Plan Free tidur** setelah ~15 menit idle (cold start 30–50 detik) dan bisa
    di-suspend kalau trafik keluarnya dianggap tidak wajar. `plan: starter` tidak
    tidur — penting karena service ini terus memanggil upstream.
-5. **Jangan commit secret** — repo upstream membawa Google OAuth client secret bawaan
+6. **Jangan commit secret** — repo upstream membawa Google OAuth client secret bawaan
    (untuk channel Gemini); sudah diganti placeholder supaya lolos secret scanning.
+7. **`exec` membuat service jadi PID 1**, sehingga trap tidak pernah jalan dan port
+   relay bisa tetap terikat saat redeploy cepat; boot berikutnya lalu gagal dengan
+   `LAN relay could not start (EADDRINUSE)` dan menyajikan 502. Sekarang tiap anak
+   punya process group sendiri dan shutdown menunggu (maks 10 detik) sebelum KILL.
+8. **System prompt ~3.970 token disuntik upstream** di wire chat dan responses
+   (`prompt_tokens: 3984` untuk `"hi"`). Wire Anthropic **tidak** menyuntiknya
+   (`input_tokens: 16`), jadi jalur `/v1/messages` adalah yang paling hemat dan
+   satu-satunya yang mengembalikan thinking di non-stream.
+9. **Burst > 4 konkuren membuat upstream membalas 502**, bukan 429. Gateway
+   menyangga body (maks 32 MiB) dan mengulang maks `OFM_RETRIES` (default 2) selama
+   belum ada byte yang dikirim ke klien.
+
+## Variabel environment
+
+| Variabel | Default | Fungsi |
+|---|---|---|
+| `OFM_CLIENT_KEY` | — (wajib) | key yang dipakai klien |
+| `OFM_HOME` | `$PWD/ofm-data` | direktori data service |
+| `OFM_INTERNAL_PORT` | `18900` | port loopback service |
+| `OFM_RELAY_PORT` | `18901` | port relay LAN |
+| `OFM_RETRIES` | `2` | pengulangan saat relay 502/503 |
+| `OFM_UPSTREAM_TIMEOUT_MS` | `300000` | timeout ke relay |
+| `OFM_MAX_BODY_BYTES` | `33554432` | batas body request |
+| `OFM_DEAD_MODEL_TTL_MS` | `1800000` | lama model mati disembunyikan |
+| `OFM_KEY_GRACE_MS` | `60000` | masa tenggang `/health` saat key belum ada |
 
 ## Lisensi
 

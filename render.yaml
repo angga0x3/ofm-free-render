@@ -8,6 +8,9 @@ services:
     startCommand: bash start.sh
     healthCheckPath: /health
     autoDeploy: true
+    # The gateway restarts the service gracefully; Render gives it this long
+    # before SIGKILL. It must stay below the relay's own shutdown window.
+    maxShutdownDelaySeconds: 30
     envVars:
       - key: NODE_VERSION
         value: "22.19.0"
@@ -15,6 +18,18 @@ services:
         value: /data/ofm
       - key: OFM_CLIENT_KEY
         generateValue: true
+      # Gateway tunables. Defaults are compiled in; listed here so they are
+      # discoverable from the dashboard.
+      - key: OFM_RETRIES
+        value: "2"                     # replay on relay 502/503 before giving up
+      - key: OFM_UPSTREAM_TIMEOUT_MS
+        value: "300000"                # reasoning models think for minutes
+      - key: OFM_MAX_BODY_BYTES
+        value: "33554432"              # 32 MiB request cap
+      - key: OFM_DEAD_MODEL_TTL_MS
+        value: "1800000"               # hide an upstream-refused model for 30 min
+      - key: OFM_KEY_GRACE_MS
+        value: "60000"                 # /health stays 200 this long while the key mints
     disk:
       name: ofm-data
       mountPath: /data

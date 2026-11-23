@@ -4,3 +4,5 @@ service.lock
 settings.json
 channel-credentials.json
 eac-user.json
+ofm-data/
+dead-models.json
